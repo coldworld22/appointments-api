@@ -1,0 +1,82 @@
+name: Deploy to Azure
+
+# Runs after CI passes on main, or by hand. Signs in to Azure with GitHub OIDC (no stored secrets),
+# applies the Bicep, builds the image in ACR and rolls the Container App to it.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  BOOTSTRAP_IMAGE: mcr.microsoft.com/dotnet/samples:aspnetapp
+
+jobs:
+  deploy:
+    # Skips cleanly in forks and until the repository variables are set.
+    if: >-
+      vars.AZURE_RESOURCE_GROUP != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      IMAGE_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.IMAGE_TAG }}
+
+      - name: Azure sign-in (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Bicep sets the container image, so pass the one already running; otherwise every infra deploy would roll back the app.
+      - name: Find the running image
+        id: current
+        run: |
+          image=$(az containerapp show -g "$RESOURCE_GROUP" -n ca-appointments \
+            --query "properties.template.containers[0].image" -o tsv 2>/dev/null || true)
+          echo "image=${image:-$BOOTSTRAP_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy infrastructure (Bicep)
+        id: infra
+        run: |
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "appointments-${GITHUB_RUN_ID}" \
+            --template-file infra/main.bicep \
+            --parameters containerImage="${{ steps.current.outputs.image }}" \
+                         authAudience="${{ vars.API_AUDIENCE }}" \
+            --query properties.outputs -o json > outputs.json
+          echo "registry=$(jq -r .registryName.value outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "loginServer=$(jq -r .registryLoginServer.value outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "app=$(jq -r .containerAppName.value outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r .apiUrl.value outputs.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image in ACR
+        run: |
+          az acr build --registry "${{ steps.infra.outputs.registry }}" \
+            --image "appointments-api:${IMAGE_TAG}" --image "appointments-api:latest" .
+
+      - name: Roll out
+        run: |
+          az containerapp update -g "$RESOURCE_GROUP" -n "${{ steps.infra.outputs.app }}" \
+            --image "${{ steps.infra.outputs.loginServer }}/appointments-api:${IMAGE_TAG}"
+
+      # Serverless SQL may be paused, so give it time to wake up.
+      - name: Smoke test
+        run: curl --fail --silent --show-error --retry 20 --retry-delay 10 --retry-all-errors "${{ steps.infra.outputs.url }}/health/ready"

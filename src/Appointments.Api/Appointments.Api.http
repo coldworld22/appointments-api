@@ -1,0 +1,32 @@
+# Requests for VS Code REST Client / Visual Studio / Rider against a local Development run
+# (docker compose up, or dotnet run with SQL Server on localhost). Dev auth reads the X-Dev-* headers.
+
+@api = http://localhost:5080
+
+### Admin opens tomorrow's slots (change the date)
+POST {{api}}/admin/slots
+X-Dev-User: admin-1
+X-Dev-Roles: Admin
+Content-Type: application/json
+
+{ "branchId": 1, "serviceTypeId": 1, "date": "2030-03-02", "opens": "08:00:00", "closes": "12:00:00", "capacityPerSlot": 3 }
+
+### Citizen looks for a slot
+GET {{api}}/branches/1/slots?serviceTypeId=1&date=2030-03-02
+X-Dev-User: citizen-1
+
+### Citizen books it
+POST {{api}}/appointments
+X-Dev-User: citizen-1
+Content-Type: application/json
+
+{ "slotId": 1 }
+
+### Citizen's appointments
+GET {{api}}/appointments/mine
+X-Dev-User: citizen-1
+
+### Counter queue for the day
+GET {{api}}/branches/1/queue?date=2030-03-02
+X-Dev-User: staff-1
+X-Dev-Roles: Staff
